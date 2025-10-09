@@ -1,0 +1,539 @@
+#include "cache.h"
+#include <unordered_map>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cassert>
+extern CACHE llc;
+
+#define TABLE_SIZE 128
+#define SLOT_COUNT 5
+
+// tuning knobs
+#define MIN_SAMPLES 0       // min total samples before trusting accuracy
+#define MAX_DEGREE 3        // maximum prefetch degree
+#define SCORE_DIV 2.0f      // divisor to scale score -> degree
+#define ACC_THRESHOLD 0.65f // minimum accuracy to consider prefetching
+#define INSERT_PROTECT_LRU 1 // protect newly inserted slots with lru <= this
+#define ALPHA 0.7f
+#define SCORE_MIN 0.9f
+
+// global counters
+static uint64_t pf_issued_total = 0, pf_issued_l2 = 0, pf_issued_llc = 0, pf_skipped_duplicate = 0;
+static uint64_t pf_useful_total = 0, pf_evicted_without_use = 0;
+static uint64_t pf_to_lower_level = 0; 
+
+#define RR_SIZE 1024
+struct RR_Entry {
+  uint64_t base_cl; // cache-line number of the base that triggered a prefetch that completed
+  bool valid;
+};
+static RR_Entry rr_table[RR_SIZE];
+
+static inline uint32_t rr_index(uint64_t base_cl) {
+  uint64_t x = base_cl ^ (base_cl >> 10) ^ (base_cl >> 20);
+  return (uint32_t)(x & (RR_SIZE - 1));
+}
+
+// Our systems have 48 bit virtual addresses, with 4kB page size. Thus the virtual page number corresponds to 48 - 12 = 36 bits
+class offset_tracker {
+  public:
+  uint64_t sign; // Signature for identifying the page
+
+  // For this signature, we exclude the page offset bits i.e. last 12 bits and take the remaining 36 bits for indexing, be it the physical page address or the virtual page address, because they will be unique for each page anyways
+
+  uint64_t last_cl_addr; // Last address accessed in this page
+
+  // 5 stride values which will be learnt and used
+  int8_t stride[5];
+
+  // Current stride value
+  int8_t current_stride;
+
+  // LRU bits for each of the stride values
+  uint8_t lru[5];
+
+  // LRU bits for the table entry i.e. each page
+  uint8_t lru_page;
+
+  // Frequency of each stride value will be stored
+  int8_t freq[5];
+
+  // how many times the prefetched line due to a stride got hit before eviction
+  uint8_t useful[5];
+
+  // how many lines prefetched due to a stride 
+  uint8_t total[5];
+
+  uint8_t outstanding_prefetches; // per page
+  
+  uint8_t timely[5]; // timeliness evidence for each slot
+  offset_tracker () {
+    sign = 0;
+    last_cl_addr = 0;
+    current_stride = 0;
+    lru_page = 0;
+    outstanding_prefetches = 0;
+    for (int i = 0; i < 5; ++i) {
+      stride[i] = 0;
+      lru[i] = i;
+      freq[i] = 0;
+      useful[i] = 0;
+      total[i] = 0;
+      timely[i] = 0;
+    }
+  };
+};
+
+offset_tracker trackers[TABLE_SIZE];
+
+// Create a map where key is prefetched address, the values are the page sign and with which stride it was prefetched.
+struct PfInfo {
+  uint64_t page_sign;
+  int8_t stride_value;
+  uint8_t  issued_level;  // 0 = L2, 1 = LLC (or enum)
+};
+static std::unordered_map<uint64_t, PfInfo> prefetch_map;
+
+// ---------- Helper functions ----------
+// find the tracker index for a page signature, or -1 if not found
+static int find_tracker_index_by_sign(uint64_t sign) {
+  for (int i = 0; i < TABLE_SIZE; ++i) {
+    if (trackers[i].sign == sign) return i;
+  }
+  return -1;
+}
+
+// find stride slot index that matches stride_value, or -1
+static int find_stride_index(const offset_tracker &t, int8_t stride_value) {
+  for (int i = 0; i < SLOT_COUNT; ++i)
+    if (t.stride[i] == stride_value){
+      return i;
+    } 
+  return -1;
+}
+
+// compute smoothed accuracy for a slot (Laplace smoothing)
+static float smoothed_accuracy(const offset_tracker &t, int slot) {
+  // (useful + 1) / (total + 3)
+  int use = t.useful[slot];
+  int tot = t.total[slot];
+  return float(use + 5) / float(tot + 3);
+}
+
+// compute a score for a slot: freq * accuracy
+static float slot_score(const offset_tracker &t, int slot) {
+  float timeliness = float(t.timely[slot]+1) / float(t.timely[slot]+4);
+  const float alpha = ALPHA;
+  return float(t.freq[slot]) * smoothed_accuracy(t, slot)*(1.0f + alpha*timeliness);
+}
+
+// find a slot to evict: the one with minimum score, but avoid evicting very new entries (insertion protection)
+static int choose_slot_to_evict(offset_tracker &t) {
+  int worst = 0;
+  float worst_score = slot_score(t, 0);
+  for (int i = 1; i < SLOT_COUNT; ++i) {
+    float sc = slot_score(t, i);
+    if (sc < worst_score) {
+      worst_score = sc;
+      worst = i;
+    } else if (sc == worst_score) {
+      // tie-break: choose slot with larger lru (less recently used)
+      if (t.lru[i] > t.lru[worst]) worst = i;
+    }
+  }
+  // Protect very newly inserted slots: if candidate's lru <= INSERT_PROTECT_LRU, pick alternative if any
+  if (t.lru[worst] < INSERT_PROTECT_LRU) {
+    //cout << "[DEBUG] Worst slot is the newest one" <<endl;
+    // try to find any slot with lru > INSERT_PROTECT_LRU, else keep worst
+    for (int i = 0; i < SLOT_COUNT; ++i) {
+      if (t.lru[i] > INSERT_PROTECT_LRU) return i;
+    }
+  }
+  
+  return worst;
+}
+
+// install a stride into a tracker: find empty slot or evict min-score
+// returns the slot index where installed
+static int install_or_evict_stride(offset_tracker &t, int8_t stride_value) {
+  // look for empty slot (stride == 0)
+  for (int i = 0; i < SLOT_COUNT; ++i) {
+    if (t.stride[i] == 0) {
+      t.stride[i] = stride_value;
+      t.freq[i] = 1;
+      t.useful[i] = 0;
+      t.total[i] = 1;
+      // bump LRU values and set this one as most recent
+      for (int j = 0; j < SLOT_COUNT; ++j) t.lru[j]++;
+      t.lru[i] = 0;
+      //cout << "[DEBUG] Current stride inserted at Empty position found at slot : " << i << endl;
+      //cout << "[DEBUG] New stride at slot " << i<< " is" << static_cast<int>(t.stride[i]) << endl;
+      return i;
+    }
+  }
+  // evict a slot by min score (with insertion protection)
+  int victim = choose_slot_to_evict(t);
+  // reset victim counters and write new stride
+  t.stride[victim] = stride_value;
+  t.freq[victim] = 1;
+  t.useful[victim] = 0;
+  t.total[victim] = 1;
+  for (int j = 0; j < SLOT_COUNT; ++j) t.lru[j]++;
+  t.lru[victim] = 0;
+  //cout << "[DEBUG] Current stride inserted at Victim position at slot : " << victim << endl;
+  return victim;
+}
+
+// ---------- Initialization ----------
+void CACHE::l2c_prefetcher_initialize() 
+{
+    //cout << "CPU " << cpu << " Region based L2 offset prefetcher" << endl;
+    for (int i=0; i<TABLE_SIZE; i++)
+    {
+      trackers[i].sign = 0;
+      trackers[i].last_cl_addr = 0;
+      trackers[i].current_stride = 0;
+      trackers[i].lru_page = i;
+      trackers[i].outstanding_prefetches=0;
+      for(int j=0; j<5; j++)
+      {
+        trackers[i].lru[j] = j;
+        trackers[i].stride[j] = 0;
+        trackers[i].freq[j] = 0;
+        trackers[i].useful[j] = 0;
+        trackers[i].total[j] = 0;
+        trackers[i].timely[j] = 0;
+      }
+    }
+    for (int i = 0; i < RR_SIZE; ++i) {
+      rr_table[i].valid = false;
+      rr_table[i].base_cl = 0;
+    }
+    prefetch_map.clear();
+}
+
+// ---------- Main operate function
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in, uint8_t critical_ip_flag)
+{
+
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    uint64_t current_sign = addr >> 12;  // page-signature
+    //cout << "[DEBUG] NEW OPERATE" << endl;
+    // Checking for tracker hit
+    int index = -1;
+    for (index=0;index<TABLE_SIZE;index++)
+    {
+        if (trackers[index].sign == current_sign)
+        {
+          //cout << "[DEBUG] The page is in the table" << endl;
+          break;
+        }
+    }
+    
+    // This is a new page which does not have a tracker assigned yet, so we will allocate one
+    if(index == TABLE_SIZE) {
+      //cout << "[DEBUG] The page is NOT in the table" << endl;
+      // find LRU page (lru_page == TABLE_SIZE-1)
+      for(index=0;index<TABLE_SIZE;index++) {
+        if(trackers[index].lru_page == (TABLE_SIZE-1)){
+          break;
+        }
+      }
+      
+      // initialize the chosen tracker
+      trackers[index].sign = current_sign;
+      trackers[index].last_cl_addr = cl_addr;
+      trackers[index].current_stride = 0;
+      for (int i = 0; i < 5; i++) {
+          trackers[index].stride[i] = 0;
+          trackers[index].lru[i] = i;   // initialize LRU in increasing order
+          trackers[index].freq[i] = 0;
+          trackers[index].useful[i] = 0;
+          trackers[index].total[i] = 0;
+          trackers[index].timely[i] = 0;
+      }
+
+      // update page LRU: increment pages with lru_page < evicted's lru_page
+      for (int i=0;i<TABLE_SIZE;i++)
+      {
+        if(trackers[i].lru_page < trackers[index].lru_page)
+        trackers[i].lru_page++;
+      }
+
+      trackers[index].lru_page = 0;
+
+      return metadata_in;
+
+    }
+    //cout << "[DBG] tracker index=" << index
+    // << " sign=" << hex << trackers[index].sign << dec
+    // << " last_cl_addr=" << trackers[index].last_cl_addr
+    // << " strides=[";
+    //for (int s=0; s<5; ++s) cout << (int)trackers[index].stride[s] << (s<4?",":"");
+    //cout << "] lru=[";
+    //for (int s=0; s<5; ++s) cout << (int)trackers[index].lru[s] << (s<4?",":"");
+    //cout << "] freq=[";
+    //for (int s=0; s<5; ++s) cout << (int)trackers[index].freq[s] << (s<4?",":"");
+    //cout << "] timely=[";
+    //for (int s=0; s<5; ++s) cout << (int)trackers[index].timely[s] << (s<4?",":"");
+    //cout << "]" << endl;
+
+    // sanity check :- at this point we should know a matching tracker index
+    if (index == -1)
+        assert(0);
+
+    // calculate the stride between the current address and the last address
+    // this bit appears overly complicated because we're calculating
+    // differences between unsigned address variables
+    if (cl_addr > trackers[index].last_cl_addr)
+        trackers[index].current_stride = cl_addr - trackers[index].last_cl_addr;
+    else {
+        trackers[index].current_stride = trackers[index].last_cl_addr - cl_addr;
+        trackers[index].current_stride *= -1;
+    }
+    //cout << "[DEBUG] current_stride " << static_cast<int>(trackers[index].current_stride) << endl;
+
+    // Now check if the current stride value is already existing in the stored list of stride values for that page
+    int val = find_stride_index(trackers[index], trackers[index].current_stride);
+    
+
+    // This stride value has been seen previously, so the frequency for that particular stride is increased. Also the LRU value for that particular value is updated
+    if(val>=0 && val<=4)
+    {
+      
+      if (trackers[index].freq[val] < 255) trackers[index].freq[val]++;
+      //cout << "[DEBUG] current_stride is in the slot " << val << " and its updated freq is " << static_cast<int>(trackers[index].freq[val]) <<  endl;
+      for(int i=0; i<5;i++)
+        trackers[index].lru[i]++;
+      trackers[index].lru[val] = 0;
+    }
+    // This stride value hasn't been observed previously, so an old value or a very less frequently used stride value is removed and the new value is added
+    else 
+    {
+      //cout << "[DEBUG] current_stride is NOT in any slot " << endl;
+
+      // Probe RR for this new stride: if there exists a completed prefetch whose base
+      // equals cl_addr - current_stride, then the new stride looks timely -> seed it.
+      bool seeded = false;
+      int64_t probe_cl = (int64_t)cl_addr - (int64_t)trackers[index].current_stride;
+      if(probe_cl>=0){
+        uint32_t ridx = rr_index((uint64_t)probe_cl);
+        if (rr_table[ridx].valid && rr_table[ridx].base_cl == (uint64_t)probe_cl) {
+            // Timely evidence from RR — seed this stride into the table
+            int slot = install_or_evict_stride(trackers[index], trackers[index].current_stride);
+            // give small headstart so it is not instantly evicted
+            trackers[index].freq[slot] = std::min<int>(2, 255);
+            trackers[index].timely[slot] = 1;
+            // optional: trackers[index].total[slot] = 1; // your choice
+            //cout << "[DEBUG] New stride seeded from RR at slot " << slot << endl;
+            seeded = true;
+            val = slot;
+        }
+      }
+      if(!seeded){
+        val = install_or_evict_stride(trackers[index], trackers[index].current_stride);
+      }
+    }
+      
+
+    // update timely evidence for each existing stride slot
+    for (int s = 0; s < SLOT_COUNT; ++s) {
+      int8_t sd = trackers[index].stride[s];
+      if (sd == 0) continue; // empty slot
+      int64_t probe_cl = (int64_t)cl_addr - (int64_t)sd;
+      if (probe_cl < 0) continue;
+      uint32_t ridx = rr_index((uint64_t)probe_cl);
+      if (rr_table[ridx].valid && rr_table[ridx].base_cl == (uint64_t)probe_cl) {
+          if (trackers[index].timely[s] < 255) trackers[index].timely[s]++;
+      }
+    }
+    // Now we choose the stride for prefetching
+    struct StrideScore {
+      int slot;
+      float score;
+    };
+    std::vector<StrideScore> stride_scores;
+    for (int s = 0; s < 5; ++s) {
+        int tot = trackers[index].total[s];
+        if (tot >= MIN_SAMPLES) {
+            float total_score = slot_score(trackers[index], s);
+            stride_scores.push_back({s, total_score});
+        }
+    }
+    std::sort(stride_scores.begin(), stride_scores.end(),
+          [](const StrideScore &a, const StrideScore &b) { return a.score > b.score; });
+
+    float ratio = 0;
+    int num_strides_to_prefetch = std::min(2, (int)stride_scores.size());
+    if(stride_scores.size()>1){
+      float ratio = stride_scores[1].score / (stride_scores[0].score + 1e-6);
+    }
+    
+    
+    
+    for (int idx=0;idx<num_strides_to_prefetch;idx++){
+      int best_slot = stride_scores[idx].slot;
+      if(best_slot>=0)
+      {
+        float accuracy = smoothed_accuracy(trackers[index], best_slot);
+        float total_score = slot_score(trackers[index], best_slot);
+        int tot = trackers[index].total[best_slot];
+        if ((tot >= MIN_SAMPLES) && (total_score >= SCORE_MIN)) {
+          int degree = std::min<int>(MAX_DEGREE, int(floor(total_score / SCORE_DIV)));
+          if(idx==1){
+            if(ratio > 0.8 && ratio<0.9){
+              degree = std::min<int>(MAX_DEGREE, int(floor(total_score / (SCORE_DIV*2))));
+            }
+          }
+          //if (trackers[index].outstanding_prefetches >= 4) {
+          //  break;
+          //} // cap e.g., 4 per page
+          //trackers[index].outstanding_prefetches++;
+          
+          if (degree <= 0) degree = 1; // at least 1 if conditions passed
+          //cout << "[DEBUG] Degree for prefetching: " << degree <<endl;
+          // throttle using MSHR occupancy: if busy, reduce degree
+          //if (MSHR.occupancy >= (MSHR.SIZE >> 1)) degree = std::max(1, degree / 2);
+
+          // issue prefetches for best_slot
+          int8_t used_stride = trackers[index].stride[best_slot];
+          //cout << "[DEBUG] used_stride " << static_cast<int>(used_stride) << "for best slot: "<< best_slot << endl;
+          for (int i = 0; i < degree; ++i) {
+            int64_t pf_cl = (int64_t)cl_addr + (int64_t)used_stride * (i + 1);
+            if (pf_cl < 0) break;
+            uint64_t pf_address = ((uint64_t)pf_cl) << LOG2_BLOCK_SIZE;
+            //uint64_t pf_address = ((uint64_t)pf_cl) << LOG2_BLOCK_SIZE;
+            // keep within same page
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE)) break;
+            // record total and mapping before issuing
+            
+            // --- Throttle by MSHR ---
+            double occ_ratio = (double)MSHR.occupancy / (double)MSHR.SIZE;
+            if (occ_ratio > 0.5) { // Stop if >80% full
+                //cout << "[DEBUG] MSHR too full (" << occ_ratio * 100 << "%). Halting prefetch.\n";
+                //break;
+                degree = std::max(1, degree / 2);
+            }
+            uint64_t line_addr = (pf_address >> LOG2_BLOCK_SIZE) << LOG2_BLOCK_SIZE;
+            if (prefetch_map.find(line_addr) != prefetch_map.end()) {
+                //This line is already prefetched — skip duplicate
+              
+              pf_skipped_duplicate++;
+              continue;
+            }
+            if (trackers[index].total[best_slot] < 255) trackers[index].total[best_slot]++;
+            
+            PfInfo info { trackers[index].sign, used_stride, (uint8_t)(MSHR.occupancy < (MSHR.SIZE/2) ? 0 : 1) };
+            prefetch_map[line_addr] = info;
+            pf_issued_total++;
+            if (info.issued_level == 0) pf_issued_l2++; else { pf_issued_llc++; pf_to_lower_level++; }
+            
+            if (MSHR.occupancy < (MSHR.SIZE/2)){
+              //cout << "[DEBUG] YAY! Prefetching happening at L2" <<endl;
+              prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+              
+            }
+            else{
+              //cout << "[DEBUG] OH MY! Prefetching happening at LLC" <<endl;
+              //if (llc.check_hit(pf_address)) {
+                // Already present in LLC — skip prefetch
+              // //cout << "[DEBUG] But the line is already there in LLC. YAY!" <<endl;
+            //   continue;
+              //}
+              prefetch_line(ip, addr, pf_address, FILL_LLC, 0);
+            }
+              
+          }
+        }
+      }
+    }
+    trackers[index].last_cl_addr = cl_addr;
+
+    for (int i=0; i<TABLE_SIZE; i++) {
+        if (trackers[i].lru_page < trackers[index].lru_page)
+            trackers[i].lru_page++;
+    }
+    trackers[index].lru_page = 0;
+
+    return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t match, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+  if (evicted_addr) {
+        uint64_t line_addr = evicted_addr >> LOG2_BLOCK_SIZE << LOG2_BLOCK_SIZE;
+        auto it = prefetch_map.find(line_addr);
+        if (it != prefetch_map.end()) {
+            pf_evicted_without_use++;
+            // no demand hit happened for this prefetch -> it's a useless prefetch
+            // Option A: increment useless counter (optional) OR rely on total-useful later
+            // Example:
+            int page_index = find_tracker_index_by_sign(it->second.page_sign);
+            if (page_index >= 0) {
+                int stride_idx = find_stride_index(trackers[page_index], it->second.stride_value);
+                if (stride_idx >= 0) {
+                  trackers[page_index].freq[stride_idx]--;
+                  trackers[page_index].useful[stride_idx]--;
+                }
+            }
+            //trackers[page_index].outstanding_prefetches--;
+
+            prefetch_map.erase(it);
+        }
+  }
+  
+  if (prefetch == 0) { // demand fill/hit
+        uint64_t line_addr = addr >> LOG2_BLOCK_SIZE << LOG2_BLOCK_SIZE;
+        auto it2 = prefetch_map.find(line_addr);
+        if (it2 != prefetch_map.end()) {
+            pf_useful_total++;
+            PfInfo info = it2->second;
+            int page_index = find_tracker_index_by_sign(info.page_sign);
+            if (page_index >= 0) {
+                int s_idx = find_stride_index(trackers[page_index], info.stride_value);
+                if (s_idx < 0) {
+                    // stride not currently in table — install it
+                    
+                    int s_idx1 = install_or_evict_stride(trackers[page_index], info.stride_value);
+                    //cout << "[DEBUG] Old Stride reinserted at " << s_idx1 <<endl;
+                    trackers[page_index].useful[s_idx1]++;
+                }
+                if (s_idx >= 0) {
+                    trackers[page_index].useful[s_idx]++; // increment useful count
+                    //cout << "[DEBUG] Prefetch found useful for stride which is already there: " << static_cast<int>(trackers[page_index].stride[s_idx])  <<endl;
+                    // optional: cap counters to 255
+                }
+            }
+            trackers[page_index].outstanding_prefetches--;
+            prefetch_map.erase(it2);
+        }
+  }else{// prefetch == non-zero => this fill resulted from a prefetch
+      uint64_t line_addr = (addr >> LOG2_BLOCK_SIZE) << LOG2_BLOCK_SIZE;
+      auto it_pf = prefetch_map.find(line_addr);
+      if (it_pf != prefetch_map.end()) {
+        PfInfo info = it_pf->second;
+        uint64_t line_cl = line_addr >> LOG2_BLOCK_SIZE; // cache-line number
+        int64_t base_cl = (int64_t)line_cl - (int64_t)info.stride_value;
+        if (base_cl >= 0) {
+          uint32_t ridx = rr_index((uint64_t)base_cl);
+          rr_table[ridx].base_cl = (uint64_t)base_cl;
+          rr_table[ridx].valid = true;
+          // debug
+          //cout << "[DEBUG] RR inserted base_cl=" << base_cl << " for pf line " << line_cl << endl;
+        }
+        // keep map entry alive — we still need it to detect later demand hit => useful
+        }
+  }
+  
+  return metadata_in;
+}
+
+void CACHE::l2c_prefetcher_final_stats()
+{
+  cout << "CPU " << cpu << " L2C Region based offset prefetcher final stats" << endl;
+  cout << "PF issued total: " << pf_issued_total << " L2: " << pf_issued_l2 << " LLC: " << pf_issued_llc << endl;
+  cout << "PF useful total: " << pf_useful_total  << endl;
+  cout << "PF evicted without use: " << pf_evicted_without_use << endl;
+  if (pf_issued_total) cout << "Accuracy: " << 100.0 * double(pf_useful_total) / double(pf_issued_total) << "%\n";
+}
