@@ -1,4 +1,9 @@
 <p align="center">
+  <h1 align="center"> Cachers </h1>
+  <p> Arnav Agarwal (22B3917) and Aaditya Gupta (22B3941) <p>
+</p>
+
+<p align="center">
   <h1 align="center"> ChampSim </h1>
   <p> ChampSim is a trace-based simulator for a microarchitecture study. You find the required trace files at (https://drive.google.com/drive/folders/1S24pPoTCJZkC8cYOv2QsDS5dPjT05fEQ) <p>
 </p>
